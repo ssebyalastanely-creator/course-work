@@ -1,0 +1,1275 @@
+import java.sql.Connection;
+import java.sql.DatabaseMetaData;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.io.File;
+
+/**
+ * DatabaseManager.java
+ *
+ * Handles saving every successfully-submitted account into a Microsoft
+ * Access database file (BankAccounts.accdb), as required by the
+ * coursework ("append the record to the MS. Access database").
+ *
+ * IMPORTANT - PLEASE READ (also explained in the setup documentation):
+ * Plain Java cannot talk to a .accdb file by itself - there is no
+ * official, free, cross-platform Access driver from Microsoft. The
+ * normal/expected way to do this from Java is the free, open-source
+ * "UCanAccess" JDBC driver. This class is written using only standard
+ * java.sql classes (Connection, PreparedStatement, etc.), so it COMPILES
+ * fine with nothing extra. To actually RUN it, you must download the
+ * UCanAccess jar files once and put them on the classpath - full,
+ * step-by-step instructions are in README.md / the Word documentation.
+ *
+ * If, for some reason, the UCanAccess driver/jars are missing, the
+ * connect() method will throw a SQLException. The GUI catches that
+ * exception so the rest of the application still works (you can still
+ * fill the form, validate it, and see the on-screen summary) - it just
+ * will not be able to write the record into the .accdb file until the
+ * driver is set up correctly.
+ */
+public class DatabaseManager {
+
+    // The Access database file will be created automatically the first
+    // time the program runs, right next to the compiled program.
+    private static final String DB_FILE_NAME = "BankAccounts.accdb";
+
+    /**
+     * Opens (and, the very first time, creates) the Access database file,
+     * then opens a JDBC connection to it using the UCanAccess driver.
+     */
+    private Connection connect() throws SQLException {
+        try {
+            // Loading the driver class explicitly is good practice, even
+            // though most modern JDBC drivers also register themselves
+            // automatically.
+            Class.forName("net.ucanaccess.jdbc.UcanaccessDriver");
+        } catch (ClassNotFoundException e) {
+            throw new SQLException(
+                "UCanAccess driver was not found on the classpath.\n"
+              + "Please follow the database setup steps in the documentation "
+              + "(download the UCanAccess jars and add them to the classpath).", e);
+        }
+
+        File dbFile = new File(DB_FILE_NAME);
+        String url;
+        if (dbFile.exists()) {
+            // Database already exists - just connect to it.
+            url = "jdbc:ucanaccess://" + dbFile.getAbsolutePath();
+        } else {
+            // Database does not exist yet - ask UCanAccess to create a
+            // brand new, empty Access 2010-format database file for us.
+            url = "jdbc:ucanaccess://" + dbFile.getAbsolutePath() + ";newdatabaseversion=V2010";
+        }
+
+        return DriverManager.getConnection(url);
+    }
+
+    /**
+     * Makes sure the "Accounts" table exists in the database. If this is
+     * the very first time the program has run, the table will not exist
+     * yet, so we create it here.
+     */
+    private void ensureTableExists(Connection conn) throws SQLException {
+        DatabaseMetaData metaData = conn.getMetaData();
+        try (ResultSet tables = metaData.getTables(null, null, "Accounts", null)) {
+            if (tables.next()) {
+                return; // table already exists - nothing to do
+            }
+        }
+
+        String createTableSql =
+                "CREATE TABLE Accounts (" +
+                "AccountNumber TEXT(20), " +
+                "FirstName TEXT(30), " +
+                "LastName TEXT(30), " +
+                "NIN TEXT(14), " +
+                "Email TEXT(60), " +
+                "PhoneNumber TEXT(15), " +
+                "DateOfBirth TEXT(10), " +
+                "AccountType TEXT(20), " +
+                "Branch TEXT(20), " +
+                "OpeningDeposit DOUBLE, " +
+                "SecondHolderNIN TEXT(14), " +
+                "DateCreated TEXT(19)" +
+                ")";
+
+        try (Statement statement = conn.createStatement()) {
+            statement.execute(createTableSql);
+        }
+    }
+
+    /**
+     * Saves one account record into the Accounts table.
+     * Returns true if the save succeeded.
+     * Throws SQLException if the driver is missing or the save fails -
+     * the caller (the GUI) decides how to inform the user.
+     */
+    public boolean insertAccount(Account account) throws SQLException {
+        try (Connection conn = connect()) {
+            ensureTableExists(conn);
+
+            String insertSql =
+                    "INSERT INTO Accounts (AccountNumber, FirstName, LastName, NIN, Email, " +
+                    "PhoneNumber, DateOfBirth, AccountType, Branch, OpeningDeposit, " +
+                    "SecondHolderNIN, DateCreated) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)";
+
+            try (PreparedStatement ps = conn.prepareStatement(insertSql)) {
+                ps.setString(1, account.getAccountNumber());
+                ps.setString(2, account.getFirstName());
+                ps.setString(3, account.getLastName());
+                ps.setString(4, account.getNin());
+                ps.setString(5, account.getEmail());
+                ps.setString(6, account.getPhoneNumber());
+                ps.setString(7, account.getDobAsText());
+                ps.setString(8, account.getAccountTypeName());
+                ps.setString(9, account.getBranch());
+                ps.setDouble(10, account.getOpeningDeposit());
+
+                // Only JointAccount objects have a second NIN; everything
+                // else stores an empty value. instanceof + a cast is the
+                // simplest beginner-friendly way to reach the extra field
+                // that only exists on the JointAccount subclass.
+                String secondNin = "";
+                if (account instanceof JointAccount) {
+                    JointAccount joint = (JointAccount) account;
+                    secondNin = joint.getSecondHolderNin();
+                }
+                ps.setString(11, secondNin);
+
+                ps.setString(12, java.time.LocalDateTime.now().toString());
+
+                ps.executeUpdate();
+            }
+        }
+        return true;
+    }
+}
+
+/**
+ * FixedDepositAccount.java
+ *
+ * Concrete subclass of Account.
+ * Rule from the coursework table: minimum deposit UGX 1,000,000.
+ * Special rule: Locked term, highest interest.
+ */
+public class FixedDepositAccount extends Account {
+
+    public FixedDepositAccount(String firstName, String lastName, String nin, String email,
+                                String phoneNumber, String pin, int dobYear, int dobMonth, int dobDay,
+                                String branch, double openingDeposit) {
+        super(firstName, lastName, nin, email, phoneNumber, pin, dobYear, dobMonth, dobDay, branch, openingDeposit);
+    }
+
+    @Override
+    public double minimumDeposit() {
+        return 1000000.0;
+    }
+
+    @Override
+    public String getAccountTypeName() {
+        return "Fixed Deposit";
+    }
+
+    @Override
+    public String getSpecialRule() {
+        return "Locked term, highest interest";
+    }
+}
+
+/**
+ * JointAccount.java
+ *
+ * Concrete subclass of Account.
+ * Rule from the coursework table: minimum deposit UGX 100,000.
+ * Special rule: Requires a second NIN.
+ *
+ * This class is slightly different from the other four because it needs
+ * ONE EXTRA piece of data that plain Account does not have: the National
+ * ID Number of the second person who will jointly own the account. We add
+ * that as its own field, with its own getter, right here in the subclass.
+ * This is a normal part of inheritance - a child class can add extra
+ * fields/behaviour on top of whatever the parent class already gives it.
+ */
+public class JointAccount extends Account {
+
+    private String secondHolderNin; // NIN of the second joint account holder
+
+    public JointAccount(String firstName, String lastName, String nin, String email,
+                         String phoneNumber, String pin, int dobYear, int dobMonth, int dobDay,
+                         String branch, double openingDeposit, String secondHolderNin) {
+        super(firstName, lastName, nin, email, phoneNumber, pin, dobYear, dobMonth, dobDay, branch, openingDeposit);
+        this.secondHolderNin = secondHolderNin;
+    }
+
+    public String getSecondHolderNin() {
+        return secondHolderNin;
+    }
+
+    @Override
+    public double minimumDeposit() {
+        return 100000.0;
+    }
+
+    @Override
+    public String getAccountTypeName() {
+        return "Joint";
+    }
+
+    @Override
+    public String getSpecialRule() {
+        return "Requires a second NIN";
+    }
+}
+
+import javax.swing.SwingUtilities;
+
+/**
+ * Main.java
+ *
+ * The entry point of the application. All it does is start the GUI on
+ * Swing's "Event Dispatch Thread" (the standard, recommended way to start
+ * any Swing application), then show the window.
+ */
+public class Main {
+    public static void main(String[] args) {
+        SwingUtilities.invokeLater(new Runnable() {
+            @Override
+            public void run() {
+                BankAccountFormGUI form = new BankAccountFormGUI();
+                form.setVisible(true);
+            }
+        });
+    }
+}
+
+/**
+ * SavingsAccount.java
+ *
+ * Concrete (non-abstract) subclass of Account.
+ * Rule from the coursework table: minimum deposit UGX 50,000.
+ * Special rule: Earns interest, no overdraft.
+ */
+public class SavingsAccount extends Account {
+
+    public SavingsAccount(String firstName, String lastName, String nin, String email,
+                           String phoneNumber, String pin, int dobYear, int dobMonth, int dobDay,
+                           String branch, double openingDeposit) {
+        // super(...) just hands all the values up to the Account constructor.
+        super(firstName, lastName, nin, email, phoneNumber, pin, dobYear, dobMonth, dobDay, branch, openingDeposit);
+    }
+
+    @Override
+    public double minimumDeposit() {
+        return 50000.0;
+    }
+
+    @Override
+    public String getAccountTypeName() {
+        return "Savings";
+    }
+
+    @Override
+    public String getSpecialRule() {
+        return "Earns interest, no overdraft";
+    }
+}
+
+/**
+ * StudentAccount.java
+ *
+ * Concrete subclass of Account.
+ * Rule from the coursework table: minimum deposit UGX 10,000.
+ * Special rule: Applicant age must be 18-25 (this extra age check is
+ * enforced separately in ValidationUtils, because it depends on the
+ * date of birth, not just the account type).
+ */
+public class StudentAccount extends Account {
+
+    public StudentAccount(String firstName, String lastName, String nin, String email,
+                           String phoneNumber, String pin, int dobYear, int dobMonth, int dobDay,
+                           String branch, double openingDeposit) {
+        super(firstName, lastName, nin, email, phoneNumber, pin, dobYear, dobMonth, dobDay, branch, openingDeposit);
+    }
+
+    @Override
+    public double minimumDeposit() {
+        return 10000.0;
+    }
+
+    @Override
+    public String getAccountTypeName() {
+        return "Student";
+    }
+
+    @Override
+    public String getSpecialRule() {
+        return "Applicant age must be 18-25";
+    }
+}
+
+import java.time.LocalDate;
+import java.util.regex.Pattern;
+
+/**
+ * ValidationUtils.java
+ *
+ * Every validation rule from section (c) of the coursework lives in this
+ * one class as a small static method. Keeping them all here (instead of
+ * scattering checks throughout the GUI code) makes the rules easy to find,
+ * easy to test, and easy to mark against the coursework table.
+ *
+ * Each "isValidXxx" method returns true/false. The GUI class is in charge
+ * of deciding WHAT MESSAGE to show when a method returns false - this
+ * class only decides PASS or FAIL.
+ */
+public class ValidationUtils {
+
+    // Pre-built regular expressions (compiled once, reused many times).
+    private static final Pattern NAME_PATTERN = Pattern.compile("^[A-Za-z]{2,30}$");
+    private static final Pattern NIN_PATTERN = Pattern.compile("^[A-Z0-9]{14}$");
+    private static final Pattern EMAIL_PATTERN =
+            Pattern.compile("^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}$");
+    // NOTE on phone format: the coursework gives the example +256772123456.
+    // Counting the digits AFTER the +256 country code in that example gives
+    // 9 digits (772123456), for 12 digits in total once you include "256".
+    // We validate against that worked example: +256 followed by 9 digits.
+    private static final Pattern PHONE_PATTERN = Pattern.compile("^\\+256\\d{9}$");
+    private static final Pattern PIN_PATTERN = Pattern.compile("^\\d{4,6}$");
+
+    /** First/Last name: required, trimmed, letters only, 2-30 characters. */
+    public static boolean isValidName(String name) {
+        if (name == null) return false;
+        return NAME_PATTERN.matcher(name.trim()).matches();
+    }
+
+    /** National ID: exactly 14 alphanumeric characters, must be UPPERCASE. */
+    public static boolean isValidNin(String nin) {
+        if (nin == null) return false;
+        return NIN_PATTERN.matcher(nin.trim()).matches();
+    }
+
+    /** Basic but solid email format check. */
+    public static boolean isValidEmail(String email) {
+        if (email == null) return false;
+        return EMAIL_PATTERN.matcher(email.trim()).matches();
+    }
+
+    /** Email and its confirmation field must match exactly. */
+    public static boolean emailsMatch(String email, String confirmEmail) {
+        if (email == null || confirmEmail == null) return false;
+        return email.trim().equals(confirmEmail.trim());
+    }
+
+    /** Ugandan phone format: +256XXXXXXXXX. */
+    public static boolean isValidPhone(String phone) {
+        if (phone == null) return false;
+        return PHONE_PATTERN.matcher(phone.trim()).matches();
+    }
+
+    /** PIN: numeric only, 4-6 digits, and not every digit the same (e.g. 0000, 11111). */
+    public static boolean isValidPin(String pin) {
+        if (pin == null) return false;
+        String trimmed = pin.trim();
+        if (!PIN_PATTERN.matcher(trimmed).matches()) {
+            return false;
+        }
+        return !isAllSameDigit(trimmed);
+    }
+
+    /** PIN and Confirm PIN must match exactly. */
+    public static boolean pinsMatch(String pin, String confirmPin) {
+        if (pin == null || confirmPin == null) return false;
+        return pin.trim().equals(confirmPin.trim());
+    }
+
+    /** Helper: checks if every character in the PIN string is the same digit. */
+    private static boolean isAllSameDigit(String pin) {
+        char first = pin.charAt(0);
+        for (int i = 1; i < pin.length(); i++) {
+            if (pin.charAt(i) != first) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** Opening deposit must be a positive number that meets or exceeds the minimum. */
+    public static boolean isValidDeposit(double deposit, double minimumRequired) {
+        return deposit >= minimumRequired;
+    }
+
+    // ---------------------------------------------------------------
+    // Date of birth / age helpers
+    // ---------------------------------------------------------------
+
+    /** Standard leap-year rule: divisible by 4, except centuries unless also divisible by 400. */
+    public static boolean isLeapYear(int year) {
+        return (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+    }
+
+    /**
+     * Returns how many days the given month has, taking leap years into
+     * account for February. month is 1-12 (1 = January).
+     */
+    public static int daysInMonth(int year, int month) {
+        int[] daysPerMonth = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+        if (month == 2 && isLeapYear(year)) {
+            return 29;
+        }
+        return daysPerMonth[month - 1];
+    }
+
+    /**
+     * Calculates the applicant's age in completed years as of today,
+     * based on their date of birth.
+     */
+    public static int calculateAge(int dobYear, int dobMonth, int dobDay) {
+        LocalDate dob = LocalDate.of(dobYear, dobMonth, dobDay);
+        LocalDate today = LocalDate.now();
+        int age = today.getYear() - dob.getYear();
+        // If the birthday has not happened yet this year, subtract one.
+        if (today.getMonthValue() < dob.getMonthValue()
+                || (today.getMonthValue() == dob.getMonthValue() && today.getDayOfMonth() < dob.getDayOfMonth())) {
+            age--;
+        }
+        return age;
+    }
+
+    /** General account age rule: must be 18-75 inclusive. */
+    public static boolean isValidGeneralAge(int age) {
+        return age >= 18 && age <= 75;
+    }
+
+    /** Extra Student account rule: must be 18-25 inclusive. */
+    public static boolean isValidStudentAge(int age) {
+        return age >= 18 && age <= 25;
+    }
+}
+
+/**
+ * Account.java
+ *
+ * This is the ABSTRACT base class for every type of bank account in the
+ * First Bank Uganda system. It is "abstract" because we never create a
+ * plain Account by itself - we always create one of its concrete child
+ * classes (SavingsAccount, CurrentAccount, FixedDepositAccount,
+ * StudentAccount, JointAccount).
+ *
+ * The class stores all the fields that EVERY account type needs
+ * (name, NIN, email, phone, PIN, date of birth, branch, deposit, account
+ * number). Each child class then adds its own special rule by overriding
+ * the abstract method minimumDeposit().
+ *
+ * This is the "polymorphism" the coursework asks for: the form code will
+ * hold a variable of type Account, but depending on which subclass was
+ * actually created, calling account.minimumDeposit() will automatically
+ * run the correct version for that account type.
+ */
+public abstract class Account {
+
+    // ---- Fields shared by every account type ----
+    protected String accountNumber;   // e.g. KLA-2026-000142 (generated, not typed by the user)
+    protected String firstName;
+    protected String lastName;
+    protected String nin;             // National ID Number (14 characters)
+    protected String email;
+    protected String phoneNumber;     // Format: +256XXXXXXXXX
+    protected String pin;             // 4-6 digit PIN (stored as text for simplicity)
+    protected int dobYear;
+    protected int dobMonth;           // 1 = January ... 12 = December
+    protected int dobDay;
+    protected String branch;          // Kampala, Gulu, Mbarara, Jinja, Mbale
+    protected double openingDeposit;
+
+    /**
+     * Simple constructor. We pass in everything the form collected.
+     * The accountNumber is NOT set here - it is generated later, only
+     * after the form confirms every field passed validation.
+     */
+    public Account(String firstName, String lastName, String nin, String email,
+                    String phoneNumber, String pin, int dobYear, int dobMonth, int dobDay,
+                    String branch, double openingDeposit) {
+        this.firstName = firstName;
+        this.lastName = lastName;
+        this.nin = nin;
+        this.email = email;
+        this.phoneNumber = phoneNumber;
+        this.pin = pin;
+        this.dobYear = dobYear;
+        this.dobMonth = dobMonth;
+        this.dobDay = dobDay;
+        this.branch = branch;
+        this.openingDeposit = openingDeposit;
+    }
+
+    // ---- ABSTRACT METHODS ----
+    // Every child class MUST provide its own version of these two methods.
+    // This is where the "Minimum Opening Deposit by Account Type" table
+    // from the coursework becomes real code.
+
+    /** @return the minimum opening deposit (in UGX) required for this account type. */
+    public abstract double minimumDeposit();
+
+    /** @return a friendly name for this account type, e.g. "Savings". */
+    public abstract String getAccountTypeName();
+
+    /** @return a short description of the special rule for this account type. */
+    public abstract String getSpecialRule();
+
+    // ---- Plain getters and setters (no advanced logic, just storage) ----
+
+    public String getAccountNumber() { return accountNumber; }
+    public void setAccountNumber(String accountNumber) { this.accountNumber = accountNumber; }
+
+    public String getFirstName() { return firstName; }
+    public String getLastName() { return lastName; }
+    public String getNin() { return nin; }
+    public String getEmail() { return email; }
+    public String getPhoneNumber() { return phoneNumber; }
+    public String getPin() { return pin; }
+    public int getDobYear() { return dobYear; }
+    public int getDobMonth() { return dobMonth; }
+    public int getDobDay() { return dobDay; }
+    public String getBranch() { return branch; }
+    public double getOpeningDeposit() { return openingDeposit; }
+
+    /**
+     * Builds the Date of Birth as a simple "YYYY-MM-DD" text string,
+     * zero-padding the month and day so it always looks like 2004-02-29.
+     */
+    public String getDobAsText() {
+        return String.format("%04d-%02d-%02d", dobYear, dobMonth, dobDay);
+    }
+
+    /**
+     * Builds the exact "Account Summary" line shown in the coursework example:
+     * ACC: KLA-2026-000142 | Okello Allan | Savings | Kampala | DOB 2004-02-29 |
+     * +256772123456 | Deposit 50,000 | okello.allan@firstbank.co.ug
+     */
+    public String getFormattedSummary() {
+        // We use a NumberFormat-style comma grouping for the deposit amount.
+        String depositText = String.format("%,.0f", openingDeposit);
+
+        return "ACC: " + accountNumber
+                + " | " + firstName + " " + lastName
+                + " | " + getAccountTypeName()
+                + " | " + branch
+                + " | DOB " + getDobAsText()
+                + " | " + phoneNumber
+                + " | Deposit " + depositText
+                + " | " + email;
+    }
+}
+
+/**
+ * AccountFactory.java
+ *
+ * A small helper class with one job: look at the Account Type the user
+ * picked in the combo box (a plain String like "Savings" or "Joint") and
+ * build the matching Account subclass object.
+ *
+ * This is the piece that makes the polymorphism in the coursework
+ * actually happen. After this method runs, the rest of the program
+ * (validation, the database, the summary text) only ever talks to the
+ * variable through its parent type "Account" - but Java will still run
+ * the correct overridden method (e.g. minimumDeposit()) for whichever
+ * real subclass was created here.
+ */
+public class AccountFactory {
+
+    /**
+     * Creates the correct Account subclass for the given account type.
+     *
+     * @param accountType     one of: Savings, Current, Fixed Deposit, Student, Joint
+     * @param secondHolderNin only used when accountType is "Joint"; pass null/"" otherwise
+     */
+    public static Account createAccount(String accountType,
+                                         String firstName, String lastName, String nin,
+                                         String email, String phoneNumber, String pin,
+                                         int dobYear, int dobMonth, int dobDay,
+                                         String branch, double openingDeposit,
+                                         String secondHolderNin) {
+
+        if (accountType.equals("Savings")) {
+            return new SavingsAccount(firstName, lastName, nin, email, phoneNumber, pin,
+                    dobYear, dobMonth, dobDay, branch, openingDeposit);
+
+        } else if (accountType.equals("Current")) {
+            return new CurrentAccount(firstName, lastName, nin, email, phoneNumber, pin,
+                    dobYear, dobMonth, dobDay, branch, openingDeposit);
+
+        } else if (accountType.equals("Fixed Deposit")) {
+            return new FixedDepositAccount(firstName, lastName, nin, email, phoneNumber, pin,
+                    dobYear, dobMonth, dobDay, branch, openingDeposit);
+
+        } else if (accountType.equals("Student")) {
+            return new StudentAccount(firstName, lastName, nin, email, phoneNumber, pin,
+                    dobYear, dobMonth, dobDay, branch, openingDeposit);
+
+        } else if (accountType.equals("Joint")) {
+            return new JointAccount(firstName, lastName, nin, email, phoneNumber, pin,
+                    dobYear, dobMonth, dobDay, branch, openingDeposit, secondHolderNin);
+
+        } else {
+            // This should never happen because the combo box only offers
+            // the five valid options, but we guard against it anyway.
+            throw new IllegalArgumentException("Unknown account type: " + accountType);
+        }
+    }
+}
+
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.time.Year;
+import java.util.Properties;
+
+/**
+ * AccountNumberGenerator.java
+ *
+ * Builds account numbers in the format required by the coursework:
+ *      BRANCHCODE-YYYY-xxxxxx
+ * e.g. KLA-2026-000142
+ *
+ * The counter is "per-year, per-branch", meaning Kampala and Gulu each
+ * keep their own separate count, and the count restarts at the start of
+ * a new year. To make the counter survive between runs of the program
+ * (so account numbers keep incrementing instead of resetting every time
+ * you start the app), the counts are saved in a small text file called
+ * "account_counters.properties" sitting next to the program.
+ */
+public class AccountNumberGenerator {
+
+    private static final String COUNTER_FILE = "account_counters.properties";
+
+    /**
+     * Converts a full branch name (as shown in the combo box) into its
+     * three-letter branch code used inside the account number.
+     */
+    public static String branchCodeFor(String branchName) {
+        switch (branchName) {
+            case "Kampala": return "KLA";
+            case "Gulu":    return "GUL";
+            case "Mbarara": return "MBR";
+            case "Jinja":   return "JIN";
+            case "Mbale":   return "MBL";
+            default:        return "UNK"; // should not happen - combo box limits choices
+        }
+    }
+
+    /**
+     * Generates the next account number for the given branch, for the
+     * current calendar year, and saves the updated counter back to disk.
+     */
+    public static synchronized String generateNextAccountNumber(String branchName) {
+        String branchCode = branchCodeFor(branchName);
+        int currentYear = Year.now().getValue();
+        String counterKey = branchCode + "_" + currentYear;
+
+        Properties counters = loadCounters();
+
+        int nextSequence = 1;
+        String existingValue = counters.getProperty(counterKey);
+        if (existingValue != null) {
+            try {
+                nextSequence = Integer.parseInt(existingValue) + 1;
+            } catch (NumberFormatException e) {
+                nextSequence = 1; // if the file got corrupted somehow, just start over safely
+            }
+        }
+
+        counters.setProperty(counterKey, String.valueOf(nextSequence));
+        saveCounters(counters);
+
+        // Format the running number as 6 digits, padded with leading zeros (e.g. 000142).
+        String paddedSequence = String.format("%06d", nextSequence);
+
+        return branchCode + "-" + currentYear + "-" + paddedSequence;
+    }
+
+    /** Reads the counters file from disk. Returns an empty Properties object if it does not exist yet. */
+    private static Properties loadCounters() {
+        Properties props = new Properties();
+        File file = new File(COUNTER_FILE);
+        if (file.exists()) {
+            try (FileInputStream in = new FileInputStream(file)) {
+                props.load(in);
+            } catch (IOException e) {
+                System.out.println("Warning: could not read " + COUNTER_FILE + " (" + e.getMessage() + ")");
+            }
+        }
+        return props;
+    }
+
+    /** Writes the counters back to disk so the next run of the program remembers them. */
+    private static void saveCounters(Properties props) {
+        try (FileOutputStream out = new FileOutputStream(COUNTER_FILE)) {
+            props.store(out, "First Bank Uganda - per-branch, per-year account number counters");
+        } catch (IOException e) {
+            System.out.println("Warning: could not save " + COUNTER_FILE + " (" + e.getMessage() + ")");
+        }
+    }
+}
+
+import javax.swing.*;
+import java.awt.*;
+import java.awt.event.ActionEvent;
+import java.awt.event.ActionListener;
+import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * BankAccountFormGUI.java
+ *
+ * This is the main window (JFrame) for the First Bank Uganda New Account
+ * Opening Application Form. It is built with plain Java Swing.
+ *
+ * The class is organised into clearly-named sections so it is easy to
+ * follow even though there are a lot of fields on the form:
+ *   1) Field declarations (every text box, combo box, and error label)
+ *   2) Constructor + buildXxxPanel() methods that lay out the screen
+ *   3) updateDayComboBox() - keeps the Day combo box correct for leap years
+ *   4) validateForm() - checks every rule from the coursework
+ *   5) handleSubmit() / handleReset() - what happens when buttons are clicked
+ */
+public class BankAccountFormGUI extends JFrame {
+
+    // ---------- Personal detail fields ----------
+    private JTextField firstNameField = new JTextField(18);
+    private JTextField lastNameField = new JTextField(18);
+    private JTextField ninField = new JTextField(18);
+    private JTextField emailField = new JTextField(18);
+    private JTextField confirmEmailField = new JTextField(18);
+    private JTextField phoneField = new JTextField(18);
+    private JPasswordField pinField = new JPasswordField(18);
+    private JPasswordField confirmPinField = new JPasswordField(18);
+
+    // ---------- Date of birth combo boxes ----------
+    private JComboBox<Integer> yearCombo;
+    private JComboBox<String> monthCombo;
+    private JComboBox<Integer> dayCombo;
+    private static final String[] MONTH_NAMES = {
+        "January", "February", "March", "April", "May", "June",
+        "July", "August", "September", "October", "November", "December"
+    };
+
+    // ---------- Account type / branch / deposit ----------
+    private JComboBox<String> accountTypeCombo;
+    private JComboBox<String> branchCombo;
+    private JTextField depositField = new JTextField(18);
+
+    // ---------- Joint-account-only field ----------
+    private JTextField secondNinField = new JTextField(18);
+
+    // ---------- Inline error labels (one red label per field) ----------
+    private JLabel firstNameError = makeErrorLabel();
+    private JLabel lastNameError = makeErrorLabel();
+    private JLabel ninError = makeErrorLabel();
+    private JLabel emailError = makeErrorLabel();
+    private JLabel confirmEmailError = makeErrorLabel();
+    private JLabel phoneError = makeErrorLabel();
+    private JLabel pinError = makeErrorLabel();
+    private JLabel confirmPinError = makeErrorLabel();
+    private JLabel dobError = makeErrorLabel();
+    private JLabel accountTypeError = makeErrorLabel();
+    private JLabel branchError = makeErrorLabel();
+    private JLabel depositError = makeErrorLabel();
+    private JLabel secondNinError = makeErrorLabel();
+
+    // ---------- Buttons + read-only summary area ----------
+    private JButton submitButton = new JButton("Submit");
+    private JButton resetButton = new JButton("Reset");
+    private JTextArea summaryArea = new JTextArea(4, 50);
+
+    // ---------- Helper objects ----------
+    private DatabaseManager databaseManager = new DatabaseManager();
+
+    private static final String SELECT_PLACEHOLDER = "-- Select --";
+    private static final String[] ACCOUNT_TYPES = {"Savings", "Current", "Fixed Deposit", "Student", "Joint"};
+    private static final String[] BRANCHES = {"Kampala", "Gulu", "Mbarara", "Jinja", "Mbale"};
+
+    /** Builds a small red, italic label used to show a field-specific error message. */
+    private static JLabel makeErrorLabel() {
+        JLabel label = new JLabel(" ");
+        label.setForeground(Color.RED);
+        label.setFont(label.getFont().deriveFont(Font.ITALIC, 11f));
+        return label;
+    }
+
+    public BankAccountFormGUI() {
+        super("First Bank Uganda - New Account Opening Form");
+
+        setLayout(new BorderLayout(10, 10));
+        add(buildHeaderPanel(), BorderLayout.NORTH);
+        add(new JScrollPane(buildFormPanel()), BorderLayout.CENTER);
+        add(buildBottomPanel(), BorderLayout.SOUTH);
+
+        wireListeners();
+        updateDayComboBox(); // make sure the Day combo starts correctly populated
+
+        setSize(780, 760);
+        setMinimumSize(new Dimension(700, 600));
+        setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+        setLocationRelativeTo(null); // centre the window on screen
+    }
+
+    // -----------------------------------------------------------------
+    // 2) LAYOUT BUILDING METHODS
+    // -----------------------------------------------------------------
+
+    private JPanel buildHeaderPanel() {
+        JPanel header = new JPanel();
+        header.setLayout(new BoxLayout(header, BoxLayout.Y_AXIS));
+        header.setBorder(BorderFactory.createEmptyBorder(12, 16, 6, 16));
+
+        JLabel bankName = new JLabel("FIRST BANK UGANDA");
+        bankName.setFont(new Font("SansSerif", Font.BOLD, 22));
+        bankName.setAlignmentX(Component.LEFT_ALIGNMENT);
+
+        JLabel formTitle = new JLabel("New Bank Account Opening Application Form");
+        formTitle.setFont(new Font("SansSerif", Font.PLAIN, 14));
+        formTitle.setAlignmentX(Component.LEFT_ALIGNMENT);
+
+        header.add(bankName);
+        header.add(formTitle);
+        return header;
+    }
+
+    private JPanel buildFormPanel() {
+        JPanel panel = new JPanel(new GridBagLayout());
+        panel.setBorder(BorderFactory.createEmptyBorder(10, 16, 10, 16));
+        GridBagConstraints gbc = new GridBagConstraints();
+        gbc.insets = new Insets(4, 4, 4, 4);
+        gbc.anchor = GridBagConstraints.WEST;
+        gbc.fill = GridBagConstraints.HORIZONTAL;
+
+        int row = 0;
+        row = addRow(panel, gbc, row, "First Name:", firstNameField, firstNameError);
+        row = addRow(panel, gbc, row, "Last Name:", lastNameField, lastNameError);
+        row = addRow(panel, gbc, row, "National ID (NIN):", ninField, ninError);
+        row = addRow(panel, gbc, row, "Email:", emailField, emailError);
+        row = addRow(panel, gbc, row, "Confirm Email:", confirmEmailField, confirmEmailError);
+        row = addRow(panel, gbc, row, "Phone Number (+256XXXXXXXXX):", phoneField, phoneError);
+        row = addRow(panel, gbc, row, "PIN (4-6 digits):", pinField, pinError);
+        row = addRow(panel, gbc, row, "Confirm PIN:", confirmPinField, confirmPinError);
+
+        // ---- Date of birth row: three combo boxes side by side ----
+        gbc.gridx = 0; gbc.gridy = row; gbc.weightx = 0;
+        panel.add(new JLabel("Date of Birth:"), gbc);
+
+        JPanel dobPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
+        int currentYear = java.time.Year.now().getValue();
+        Integer[] years = new Integer[currentYear - 1940 + 1];
+        for (int i = 0; i < years.length; i++) {
+            years[i] = 1940 + i;
+        }
+        yearCombo = new JComboBox<>(years);
+        yearCombo.setSelectedItem(currentYear - 25); // sensible default
+        monthCombo = new JComboBox<>(MONTH_NAMES);
+        dayCombo = new JComboBox<>();
+
+        dobPanel.add(new JLabel("Year:"));
+        dobPanel.add(yearCombo);
+        dobPanel.add(new JLabel("Month:"));
+        dobPanel.add(monthCombo);
+        dobPanel.add(new JLabel("Day:"));
+        dobPanel.add(dayCombo);
+
+        gbc.gridx = 1; gbc.weightx = 1;
+        panel.add(dobPanel, gbc);
+        row++;
+        gbc.gridx = 1; gbc.gridy = row; gbc.weightx = 1;
+        panel.add(dobError, gbc);
+        row++;
+
+        // ---- Account Type ----
+        accountTypeCombo = new JComboBox<>();
+        accountTypeCombo.addItem(SELECT_PLACEHOLDER);
+        for (String type : ACCOUNT_TYPES) {
+            accountTypeCombo.addItem(type);
+        }
+        row = addRow(panel, gbc, row, "Account Type:", accountTypeCombo, accountTypeError);
+
+        // ---- Branch ----
+        branchCombo = new JComboBox<>();
+        branchCombo.addItem(SELECT_PLACEHOLDER);
+        for (String branch : BRANCHES) {
+            branchCombo.addItem(branch);
+        }
+        row = addRow(panel, gbc, row, "Branch:", branchCombo, branchError);
+
+        // ---- Opening deposit ----
+        row = addRow(panel, gbc, row, "Opening Deposit (UGX):", depositField, depositError);
+
+        // ---- Second NIN (Joint accounts only) ----
+        row = addRow(panel, gbc, row, "Second Applicant NIN (Joint accounts only):", secondNinField, secondNinError);
+
+        return panel;
+    }
+
+    /** Adds one "Label | Field" row, plus the matching error label directly underneath, to the form panel. */
+    private int addRow(JPanel panel, GridBagConstraints gbc, int row, String labelText,
+                        JComponent field, JLabel errorLabel) {
+        gbc.gridx = 0; gbc.gridy = row; gbc.weightx = 0;
+        panel.add(new JLabel(labelText), gbc);
+
+        gbc.gridx = 1; gbc.weightx = 1;
+        panel.add(field, gbc);
+        row++;
+
+        gbc.gridx = 1; gbc.gridy = row; gbc.weightx = 1;
+        panel.add(errorLabel, gbc);
+        row++;
+
+        return row;
+    }
+
+    private JPanel buildBottomPanel() {
+        JPanel bottom = new JPanel(new BorderLayout(8, 8));
+        bottom.setBorder(BorderFactory.createEmptyBorder(0, 16, 12, 16));
+
+        JPanel buttonPanel = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        buttonPanel.add(submitButton);
+        buttonPanel.add(resetButton);
+
+        JPanel summaryPanel = new JPanel(new BorderLayout(4, 4));
+        summaryPanel.add(new JLabel("Account Summary is Below:"), BorderLayout.NORTH);
+        summaryArea.setEditable(false);
+        summaryArea.setLineWrap(true);
+        summaryArea.setWrapStyleWord(true);
+        summaryArea.setBackground(new Color(245, 245, 245));
+        summaryPanel.add(new JScrollPane(summaryArea), BorderLayout.CENTER);
+
+        bottom.add(buttonPanel, BorderLayout.NORTH);
+        bottom.add(summaryPanel, BorderLayout.CENTER);
+        return bottom;
+    }
+
+    // -----------------------------------------------------------------
+    // 3) LISTENERS
+    // -----------------------------------------------------------------
+
+    private void wireListeners() {
+        // Whenever Year or Month changes, the number of valid Days can change
+        // (28/29/30/31), so we rebuild the Day combo box every time.
+        ActionListener dobChangedListener = new ActionListener() {
+            @Override
+            public void actionPerformed(ActionEvent e) {
+                updateDayComboBox();
+            }
+        };
+        yearCombo.addActionListener(dobChangedListener);
+        monthCombo.addActionListener(dobChangedListener);
+
+        submitButton.addActionListener(new ActionListener() {
+            @Override
+            public void actionPerformed(ActionEvent e) {
+                handleSubmit();
+            }
+        });
+
+        resetButton.addActionListener(new ActionListener() {
+            @Override
+            public void actionPerformed(ActionEvent e) {
+                handleReset();
+            }
+        });
+    }
+
+    /** Rebuilds the Day combo box so it always has the correct number of days for the chosen Year/Month. */
+    private void updateDayComboBox() {
+        int year = (Integer) yearCombo.getSelectedItem();
+        int month = monthCombo.getSelectedIndex() + 1; // combo index 0 = January = month 1
+
+        Integer previouslySelectedDay = (Integer) dayCombo.getSelectedItem();
+        int maxDay = ValidationUtils.daysInMonth(year, month);
+
+        dayCombo.removeAllItems();
+        for (int d = 1; d <= maxDay; d++) {
+            dayCombo.addItem(d);
+        }
+
+        // Try to keep the same day selected if it is still valid (e.g. switching
+        // from March 31 to April should fall back to April 30, not crash).
+        if (previouslySelectedDay != null && previouslySelectedDay <= maxDay) {
+            dayCombo.setSelectedItem(previouslySelectedDay);
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // 4) VALIDATION
+    // -----------------------------------------------------------------
+
+    /**
+     * Checks every field against the rules in the coursework. Any problems
+     * found are (a) written into the matching red inline error label and
+     * (b) added to the returned list, which is used for the pop-up summary
+     * dialog. An empty returned list means the form is fully valid.
+     */
+    private List<String> validateForm(Account accountBeingChecked, String accountType,
+                                       double deposit, boolean depositParsedOk) {
+        List<String> problems = new ArrayList<>();
+
+        String firstName = firstNameField.getText().trim();
+        String lastName = lastNameField.getText().trim();
+        String nin = ninField.getText().trim().toUpperCase();
+        String email = emailField.getText().trim();
+        String confirmEmail = confirmEmailField.getText().trim();
+        String phone = phoneField.getText().trim();
+        String pin = new String(pinField.getPassword()).trim();
+        String confirmPin = new String(confirmPinField.getPassword()).trim();
+        String secondNin = secondNinField.getText().trim().toUpperCase();
+
+        if (!ValidationUtils.isValidName(firstName)) {
+            setError(firstNameError, "Letters only, 2-30 characters.");
+            problems.add("First Name: letters only, 2-30 characters.");
+        }
+        if (!ValidationUtils.isValidName(lastName)) {
+            setError(lastNameError, "Letters only, 2-30 characters.");
+            problems.add("Last Name: letters only, 2-30 characters.");
+        }
+        if (!ValidationUtils.isValidNin(nin)) {
+            setError(ninError, "Must be exactly 14 uppercase alphanumeric characters.");
+            problems.add("National ID (NIN): must be exactly 14 uppercase alphanumeric characters.");
+        }
+        if (!ValidationUtils.isValidEmail(email)) {
+            setError(emailError, "Enter a valid email address.");
+            problems.add("Email: not a valid email address.");
+        } else if (!ValidationUtils.emailsMatch(email, confirmEmail)) {
+            setError(confirmEmailError, "Does not match Email.");
+            problems.add("Confirm Email: does not match Email.");
+        }
+        if (!ValidationUtils.isValidPhone(phone)) {
+            setError(phoneError, "Format must be +256XXXXXXXXX.");
+            problems.add("Phone Number: must follow the format +256XXXXXXXXX.");
+        }
+        if (!ValidationUtils.isValidPin(pin)) {
+            setError(pinError, "4-6 digits, not all identical (e.g. 0000).");
+            problems.add("PIN: must be 4-6 digits and not all identical digits.");
+        } else if (!ValidationUtils.pinsMatch(pin, confirmPin)) {
+            setError(confirmPinError, "Does not match PIN.");
+            problems.add("Confirm PIN: does not match PIN.");
+        }
+
+        // ---- Age (derived from Date of Birth) ----
+        int dobYear = (Integer) yearCombo.getSelectedItem();
+        int dobMonth = monthCombo.getSelectedIndex() + 1;
+        int dobDay = (Integer) dayCombo.getSelectedItem();
+        int age = ValidationUtils.calculateAge(dobYear, dobMonth, dobDay);
+
+        if (!ValidationUtils.isValidGeneralAge(age)) {
+            setError(dobError, "Applicant age must be 18-75 (current age: " + age + ").");
+            problems.add("Date of Birth: applicant age must be 18-75 (current age: " + age + ").");
+        } else if (accountType.equals("Student") && !ValidationUtils.isValidStudentAge(age)) {
+            setError(dobError, "Student accounts require age 18-25 (current age: " + age + ").");
+            problems.add("Date of Birth: Student accounts require applicant age 18-25 (current age: " + age + ").");
+        }
+
+        // ---- Account Type ----
+        if (accountType.equals(SELECT_PLACEHOLDER)) {
+            setError(accountTypeError, "Please select an account type.");
+            problems.add("Account Type: please select exactly one account type.");
+        }
+
+        // ---- Branch ----
+        String branch = (String) branchCombo.getSelectedItem();
+        if (branch.equals(SELECT_PLACEHOLDER)) {
+            setError(branchError, "Please select a branch.");
+            problems.add("Branch: please select exactly one branch.");
+        }
+
+        // ---- Opening Deposit (this is the polymorphic check) ----
+        if (!depositParsedOk) {
+            setError(depositError, "Enter a valid numeric amount.");
+            problems.add("Opening Deposit: must be a valid number.");
+        } else if (accountBeingChecked != null) {
+            // accountBeingChecked.minimumDeposit() calls the OVERRIDDEN version
+            // for whichever subclass (Savings/Current/.../Joint) was selected.
+            // This is the polymorphism the coursework specifically asks for.
+            double minimumRequired = accountBeingChecked.minimumDeposit();
+            if (!ValidationUtils.isValidDeposit(deposit, minimumRequired)) {
+                String msg = String.format("Minimum for %s accounts is UGX %,.0f.",
+                        accountBeingChecked.getAccountTypeName(), minimumRequired);
+                setError(depositError, msg);
+                problems.add("Opening Deposit: " + msg);
+            }
+        }
+
+        // ---- Second NIN (only required for Joint accounts) ----
+        if (accountType.equals("Joint")) {
+            if (!ValidationUtils.isValidNin(secondNin)) {
+                setError(secondNinError, "Joint accounts require a valid 14-character second NIN.");
+                problems.add("Second Applicant NIN: required for Joint accounts, must be 14 uppercase alphanumeric characters.");
+            } else if (secondNin.equals(nin)) {
+                setError(secondNinError, "Second NIN must be different from the applicant's own NIN.");
+                problems.add("Second Applicant NIN: must be different from the applicant's own NIN.");
+            }
+        }
+
+        return problems;
+    }
+
+    private void setError(JLabel label, String message) {
+        label.setText(message);
+    }
+
+    private void clearAllErrors() {
+        JLabel[] allErrorLabels = {
+            firstNameError, lastNameError, ninError, emailError, confirmEmailError,
+            phoneError, pinError, confirmPinError, dobError, accountTypeError,
+            branchError, depositError, secondNinError
+        };
+        for (JLabel label : allErrorLabels) {
+            label.setText(" ");
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // 5) BUTTON ACTIONS
+    // -----------------------------------------------------------------
+
+    private void handleSubmit() {
+        clearAllErrors();
+
+        String accountType = (String) accountTypeCombo.getSelectedItem();
+        String branch = (String) branchCombo.getSelectedItem();
+
+        // Parse the opening deposit safely.
+        double deposit = 0.0;
+        boolean depositParsedOk = true;
+        try {
+            deposit = Double.parseDouble(depositField.getText().trim());
+            if (deposit < 0) {
+                depositParsedOk = false;
+            }
+        } catch (NumberFormatException e) {
+            depositParsedOk = false;
+        }
+
+        int dobYear = (Integer) yearCombo.getSelectedItem();
+        int dobMonth = monthCombo.getSelectedIndex() + 1;
+        int dobDay = (Integer) dayCombo.getSelectedItem();
+
+        // Build an Account object EARLY, using the AccountFactory, as long as a
+        // real account type was chosen. We build it before validation finishes
+        // so that validateForm() can call its overridden minimumDeposit() and
+        // get the correct, type-specific minimum - that is the polymorphism
+        // requirement from the coursework in action.
+        Account account = null;
+        if (!accountType.equals(SELECT_PLACEHOLDER)) {
+            account = AccountFactory.createAccount(
+                    accountType,
+                    firstNameField.getText().trim(),
+                    lastNameField.getText().trim(),
+                    ninField.getText().trim().toUpperCase(),
+                    emailField.getText().trim(),
+                    phoneField.getText().trim(),
+                    new String(pinField.getPassword()).trim(),
+                    dobYear, dobMonth, dobDay,
+                    branch,
+                    deposit,
+                    secondNinField.getText().trim().toUpperCase()
+            );
+        }
+
+        List<String> problems = validateForm(account, accountType, deposit, depositParsedOk);
+
+        if (!problems.isEmpty()) {
+            StringBuilder message = new StringBuilder("Please fix the following problems:\n\n");
+            for (String problem : problems) {
+                message.append("- ").append(problem).append("\n");
+            }
+            JOptionPane.showMessageDialog(this, message.toString(),
+                    "Form has errors", JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+
+        // ---- Everything is valid: generate the account number and save ----
+        String accountNumber = AccountNumberGenerator.generateNextAccountNumber(branch);
+        account.setAccountNumber(accountNumber);
+
+        String summaryText = account.getFormattedSummary();
+
+        // Try to persist the record into the MS Access database. If the
+        // UCanAccess driver has not been set up yet, we still show the
+        // summary on screen (so the form remains useful for testing/marking)
+        // but we warn the user that the database save did not happen.
+        try {
+            databaseManager.insertAccount(account);
+            summaryArea.setText(summaryText);
+            summaryArea.setCaretPosition(0); // make sure the summary line is visible, not scrolled away
+            JOptionPane.showMessageDialog(this,
+                    "Account created and saved to the database successfully.",
+                    "Success", JOptionPane.INFORMATION_MESSAGE);
+        } catch (SQLException e) {
+            summaryArea.setText(summaryText + "\n\n[NOTE: Could not save to the Access database - "
+                    + e.getMessage() + "]");
+            summaryArea.setCaretPosition(0); // make sure the summary line is visible, not scrolled away
+            JOptionPane.showMessageDialog(this,
+                    "Account summary was created, but saving to the Access database failed:\n"
+                  + e.getMessage()
+                  + "\n\nSee the setup documentation for installing the UCanAccess driver.",
+                    "Database Warning", JOptionPane.WARNING_MESSAGE);
+        }
+    }
+
+    private void handleReset() {
+        firstNameField.setText("");
+        lastNameField.setText("");
+        ninField.setText("");
+        emailField.setText("");
+        confirmEmailField.setText("");
+        phoneField.setText("");
+        pinField.setText("");
+        confirmPinField.setText("");
+        depositField.setText("");
+        secondNinField.setText("");
+
+        accountTypeCombo.setSelectedIndex(0);
+        branchCombo.setSelectedIndex(0);
+        yearCombo.setSelectedItem(java.time.Year.now().getValue() - 25);
+        monthCombo.setSelectedIndex(0);
+        updateDayComboBox();
+        dayCombo.setSelectedIndex(0);
+
+        clearAllErrors();
+        summaryArea.setText("");
+    }
+}
+
+/**
+ * CurrentAccount.java
+ *
+ * Concrete subclass of Account.
+ * Rule from the coursework table: minimum deposit UGX 200,000.
+ * Special rule: Overdraft allowed, no interest.
+ */
+public class CurrentAccount extends Account {
+
+    public CurrentAccount(String firstName, String lastName, String nin, String email,
+                           String phoneNumber, String pin, int dobYear, int dobMonth, int dobDay,
+                           String branch, double openingDeposit) {
+        super(firstName, lastName, nin, email, phoneNumber, pin, dobYear, dobMonth, dobDay, branch, openingDeposit);
+    }
+
+    @Override
+    public double minimumDeposit() {
+        return 200000.0;
+    }
+
+    @Override
+    public String getAccountTypeName() {
+        return "Current";
+    }
+
+    @Override
+    public String getSpecialRule() {
+        return "Overdraft allowed, no interest";
+    }
+}
